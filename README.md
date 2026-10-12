@@ -653,9 +653,11 @@ The provider IDs in `models.json` and `auth.json` must match. Then select the cu
 zot --provider my-company --model company-llm-v2
 ```
 
+When no provider is selected (`--provider` absent, no `provider` in `config.json`), zot falls back to any provider with stored or environment credentials instead of showing a login error; custom providers join that scan after the built-ins in sorted name order, so plain `zot` lands on a credentialed custom provider. The interactive TUI saves that choice to `config.json` so the next launch starts there directly; print and JSON runs leave `config.json` untouched. `"auth": "none"` providers are never auto-selected, and an explicit `--provider` or a provider saved in `config.json` is always respected. A saved provider zot does not recognize (a typo, or one removed from `models.json`) is repaired to the first credentialed provider and persisted.
+
 ##### Live model discovery for custom providers
 
-Set `"discover": true` on a custom provider to list its models from the OpenAI-compatible `/models` endpoint instead of, or in addition to, a static `models` array. Discovery is off by default and requires a provider-level `baseUrl`.
+Set `"discover": true` on a custom provider to list its models from the OpenAI-compatible `/models` endpoint instead of, or in addition to, a static `models` array. Discovery is off by default and requires a provider-level `baseUrl`. When zot has to derive a default model for such a provider and the endpoint yields no models, startup fails with an error naming the endpoint; an explicitly configured model id still launches, since custom providers accept any id their endpoint understands.
 
 ```json
 {

@@ -135,10 +135,12 @@ func TestValidateAndRepairConfig_MismatchedPair(t *testing.T) {
 
 // TestValidateAndRepairConfig_UnknownProvider resets to anthropic and
 // clears the model when the saved provider id isn't recognised
-// (e.g. user removed it from a previous build).
+// (e.g. user removed it from a previous build). Credentials are isolated
+// so no provider pre-empts the anthropic default.
 func TestValidateAndRepairConfig_UnknownProvider(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("ZOT_HOME", home)
+	clearBuiltinCredentialEnv(t)
 
 	b, _ := json.Marshal(Config{Provider: "made-up-provider", Model: "some-model"})
 	_ = os.WriteFile(filepath.Join(home, "config.json"), b, 0o644)
@@ -151,6 +153,41 @@ func TestValidateAndRepairConfig_UnknownProvider(t *testing.T) {
 	}
 	if out.Model != "" {
 		t.Errorf("model not cleared: %q", out.Model)
+	}
+}
+
+// TestValidateAndRepairConfig_UnknownProviderPrefersCredentialedCustom
+// pins the repair target on a models.json-only setup: when no built-in
+// provider has a credential but a custom provider does, an unknown
+// config provider must be reset to that custom provider, not to
+// "anthropic". Resetting to anthropic would strand the user at the
+// login dialog on every launch (the saved choice suppresses the
+// credential auto-fallback) even though they are logged in.
+func TestValidateAndRepairConfig_UnknownProviderPrefersCredentialedCustom(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("ZOT_HOME", home)
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("AAA_API_KEY", "")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "api": "openai", "models": [{"id": "aaa-one"}]}
+	}}`)
+	if err := AuthStoreFor().SetAPIKey("aaa", "aaa-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	b, _ := json.Marshal(Config{Provider: "made-up-provider", Model: "some-model"})
+	if err := os.WriteFile(filepath.Join(home, "config.json"), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ValidateAndRepairConfig()
+
+	out, _ := LoadConfig()
+	if out.Provider != "aaa" {
+		t.Fatalf("provider reset to %q, want credentialed custom aaa", out.Provider)
+	}
+	if out.Model != "" {
+		t.Fatalf("model not cleared: %q", out.Model)
 	}
 }
 

@@ -3,8 +3,11 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/patriceckhart/zot/packages/continuous"
@@ -125,5 +128,51 @@ func TestContinuousCompactionUsesSelectedModel(t *testing.T) {
 	}
 	if policy.ContextWindow != model.ContextWindow || policy.ReserveTokens == 0 {
 		t.Fatalf("incorrect model policy: %+v", policy)
+	}
+}
+
+// TestContinuousInferenceDerivesCustomDefaultAfterRefresh checks that a
+// provider-only AgentConfig for a discovery-enabled custom provider
+// derives its default model after refreshing the catalog, so the global
+// (anthropic) default id is never routed to a custom endpoint.
+func TestContinuousInferenceDerivesCustomDefaultAfterRefresh(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	t.Setenv("AAA_API_KEY", "")
+	var requests atomic.Int32
+	server := newModelsServer(t, &requests, "", "aaa-first", "aaa-second")
+	loadTestModelsJSON(t, fmt.Sprintf(`{"providers": {"aaa": {"baseUrl": %q, "api": "openai", "discover": true}}}`, server.URL+"/v1"))
+	host := Resolved{Provider: "openai", Model: "gpt-4o-mini", Credential: "synthetic", AuthMethod: "apikey"}
+
+	other, err := continuousInference(context.Background(), host, continuous.AgentConfig{Provider: "aaa"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Provider != "aaa" {
+		t.Fatalf("provider = %q, want aaa", other.Provider)
+	}
+	if other.Model != "aaa-first" {
+		t.Fatalf("model = %q, want aaa-first derived after the refresh", other.Model)
+	}
+	if other.Credential != "" {
+		t.Fatalf("credential = %q, want empty (host credentials must not leak)", other.Credential)
+	}
+}
+
+// TestContinuousInferenceDiscoveryFailureErrors mirrors resolve's
+// refusal path: when continuousInference must derive the default model
+// for a discovery-enabled provider and the refresh yields nothing, the
+// routing fails instead of sending the global (anthropic) default id to
+// the custom endpoint.
+func TestContinuousInferenceDiscoveryFailureErrors(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	t.Setenv("AAA_API_KEY", "")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "api": "openai", "discover": true}
+	}}`)
+	host := Resolved{Provider: "openai", Model: "gpt-4o-mini", Credential: "synthetic", AuthMethod: "apikey"}
+
+	_, err := continuousInference(context.Background(), host, continuous.AgentConfig{Provider: "aaa"})
+	if err == nil || !strings.Contains(err.Error(), "discover:true") {
+		t.Fatalf("err = %v, want the no-discovered-models error", err)
 	}
 }

@@ -278,3 +278,115 @@ func TestResolveRestoresDiscoveredCustomModelAfterRestart(t *testing.T) {
 		t.Fatalf("requests = %d, want no extra probe", requests.Load())
 	}
 }
+
+// TestResolveDerivesCustomDefaultAfterDiscoveryRefresh reproduces the
+// fresh-install portable setup: a discovery-only custom provider with a
+// stored key, an empty catalog, and no builtin credentials. The fallback
+// picks the custom provider, and the default model must be derived after
+// the synchronous discovery refresh — not from the pre-refresh empty
+// catalog, where defaultModelForProvider returns the global (anthropic)
+// default id.
+func TestResolveDerivesCustomDefaultAfterDiscoveryRefresh(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("AAA_API_KEY", "")
+	var requests atomic.Int32
+	server := newModelsServer(t, &requests, "Bearer dummy", "aaa-first", "aaa-second")
+	loadTestModelsJSON(t, fmt.Sprintf(`{"providers": {"aaa": {"baseUrl": %q, "api": "openai", "discover": true}}}`, server.URL+"/v1"))
+	if err := AuthStoreFor().SetAPIKey("aaa", "dummy"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Resolve(Args{NoSkill: true}, true)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if requests.Load() < 1 {
+		t.Fatalf("requests = %d, want a discovery probe", requests.Load())
+	}
+	if r.Provider != "aaa" {
+		t.Fatalf("provider = %q, want aaa", r.Provider)
+	}
+	if r.Model != "aaa-first" {
+		t.Fatalf("model = %q, want aaa-first derived after the refresh", r.Model)
+	}
+	if r.BaseURL != server.URL+"/v1" {
+		t.Fatalf("BaseURL = %q, want %q", r.BaseURL, server.URL+"/v1")
+	}
+	if r.Credential != "dummy" {
+		t.Fatalf("credential = %q, want dummy", r.Credential)
+	}
+}
+
+// TestResolveDerivesCustomDefaultAfterDiscoveryRefreshExplicitProvider
+// covers the re-derivation without the fallback: an explicit --provider
+// with an auto-derived model must also pick a discovered id once the
+// refresh fills the catalog.
+func TestResolveDerivesCustomDefaultAfterDiscoveryRefreshExplicitProvider(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	t.Setenv("AAA_API_KEY", "")
+	var requests atomic.Int32
+	server := newModelsServer(t, &requests, "Bearer dummy", "aaa-first", "aaa-second")
+	loadTestModelsJSON(t, fmt.Sprintf(`{"providers": {"aaa": {"baseUrl": %q, "api": "openai", "discover": true}}}`, server.URL+"/v1"))
+	if err := AuthStoreFor().SetAPIKey("aaa", "dummy"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Resolve(Args{Provider: "aaa", NoSkill: true}, true)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if r.Provider != "aaa" {
+		t.Fatalf("provider = %q, want aaa", r.Provider)
+	}
+	if r.Model != "aaa-first" {
+		t.Fatalf("model = %q, want aaa-first derived after the refresh", r.Model)
+	}
+}
+
+// TestResolveDiscoveryFailureAutoDerivedErrors checks the refusal path:
+// when zot must derive the default model itself and discovery yields
+// nothing, resolve fails with the remedy message instead of routing the
+// global (anthropic) default id to the custom endpoint.
+func TestResolveDiscoveryFailureAutoDerivedErrors(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("AAA_API_KEY", "")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "api": "openai", "discover": true}
+	}}`)
+	if err := AuthStoreFor().SetAPIKey("aaa", "dummy"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Resolve(Args{Provider: "aaa", NoSkill: true}, true)
+	if err == nil || !strings.Contains(err.Error(), "discover:true") {
+		t.Fatalf("err = %v, want the no-discovered-models error", err)
+	}
+}
+
+// TestResolveDiscoveryFailureKeepsExplicitModel pins the lenient path:
+// an explicitly chosen model id launches even when discovery fails (a
+// custom endpoint accepts any id), so a temporarily unreachable server
+// does not block startup for a configured model.
+func TestResolveDiscoveryFailureKeepsExplicitModel(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	t.Setenv("AAA_API_KEY", "")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "api": "openai", "discover": true}
+	}}`)
+	if err := AuthStoreFor().SetAPIKey("aaa", "dummy"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Resolve(Args{Provider: "aaa", Model: "aaa-explicit", NoSkill: true}, true)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if r.Model != "aaa-explicit" {
+		t.Fatalf("model = %q, want the explicitly requested id", r.Model)
+	}
+	if r.BaseURL != "http://127.0.0.1:1/v1" {
+		t.Fatalf("BaseURL = %q, want the provider base URL", r.BaseURL)
+	}
+}

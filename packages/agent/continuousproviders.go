@@ -27,6 +27,21 @@ func continuousInference(ctx context.Context, host Resolved, config continuous.A
 			model = host.Model
 		} else {
 			model = defaultModelForProvider(name)
+			if isDiscoverableCustomProvider(name) {
+				if _, err := provider.FindModel(name, model); err != nil {
+					// The derived default may predate discovery populating
+					// this provider's catalog, in which case it is the
+					// global default (an anthropic id). Restore the catalog
+					// before routing so that id is never sent to a custom
+					// endpoint; if discovery yields nothing here, fail the
+					// routing rather than send it anyway.
+					_ = RefreshCustomProviderModels(ctx)
+					if len(provider.ModelsForProvider(name)) == 0 {
+						return Resolved{}, noDiscoveredModelsError(name)
+					}
+					model = defaultModelForProvider(name)
+				}
+			}
 		}
 	}
 	if name == host.Provider && model == host.Model {

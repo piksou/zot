@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 
 	zotdocs "github.com/patriceckhart/zot"
@@ -273,6 +274,39 @@ func isBuiltinProvider(name string) bool {
 	return false
 }
 
+// firstCredentialedProvider returns the provider zot falls back to when
+// the configured one is unknown: the highest-priority built-in provider
+// with a usable credential (anthropic first, then deepseek, kimi,
+// openai-codex, openai — the effective preference of the sequential
+// reset this replaced), then the first custom provider from models.json
+// with one (sorted by name so the choice is deterministic), and finally
+// "anthropic". Without the custom tier, a typo'd config provider on a
+// models.json-only setup would be reset to "anthropic", which has no
+// credential and suppresses the auto-fallback on every later launch —
+// the user is then asked to log in on each start even though their
+// custom provider is logged in.
+func firstCredentialedProvider() string {
+	for _, p := range []string{"anthropic", "deepseek", "kimi", "openai-codex", "openai"} {
+		if CredentialAvailable(p) {
+			return p
+		}
+	}
+	var customs []string
+	for name, customCfg := range provider.CustomProviders() {
+		if isBuiltinProvider(name) || customCfg.NoAuth {
+			continue
+		}
+		if CredentialAvailable(name) {
+			customs = append(customs, name)
+		}
+	}
+	sort.Strings(customs)
+	if len(customs) > 0 {
+		return customs[0]
+	}
+	return "anthropic"
+}
+
 // providerAliases maps common short / alternate provider names to the
 // canonical id in knownProviders. Users (and other agents) reach for
 // "bedrock" or "vertex" far more naturally than the fully-qualified
@@ -352,27 +386,19 @@ func resolve(ctx context.Context, args Args, requireCred, inferenceOnly bool) (R
 		// the first provider that has credentials, or anthropic.
 		// Custom providers (from models.json) are already accepted
 		// by isKnownProvider, so we only reach here for truly unknown
-		// names.
-		provName = "anthropic"
-		if CredentialAvailable("openai") {
-			provName = "openai"
-		}
-		if CredentialAvailable("openai-codex") {
-			provName = "openai-codex"
-		}
-		if CredentialAvailable("kimi") {
-			provName = "kimi"
-		}
-		if CredentialAvailable("deepseek") {
-			provName = "deepseek"
-		}
-		if CredentialAvailable("anthropic") {
-			provName = "anthropic"
-		}
+		// names. firstCredentialedProvider also considers credentialed
+		// custom providers: resetting to "anthropic" when the only
+		// credential in the house belongs to a custom provider would
+		// poison config.json and demand a login on every launch.
+		provName = firstCredentialedProvider()
 		// Reset the saved config so this doesn't keep happening.
-		cfg.Provider = provName
-		cfg.Model = ""
-		_ = SaveConfig(cfg)
+		// Only save if we're not in requireCred mode (print/json),
+		// since those modes won't show a login dialog anyway.
+		if !requireCred {
+			cfg.Provider = provName
+			cfg.Model = ""
+			_ = SaveConfig(cfg)
+		}
 	}
 
 	var (
@@ -416,17 +442,8 @@ func resolve(ctx context.Context, args Args, requireCred, inferenceOnly bool) (R
 	// if no credential is found — the tui will show the login dialog or
 	// surface a clear credential error rather than silently switching to
 	// a completely different provider and model.
-	// autoFellBack tracks whether the provider was changed by the
-	// auto-fallback loop (no explicit provider from CLI or config,
-	// and the default had no credentials). When false, the provider
-	// came from the user's explicit choice (--provider or config.json)
-	// and must be respected, including any model id that may belong
-	// to a different provider in the catalog — for example when using
-	// a gateway/router like OpenRouter with "deepseek/deepseek-v4-flash".
-	var autoFellBack bool
 	userPickedProvider := args.Provider != "" || cfg.Provider != ""
 	if credErr != nil && !userPickedProvider && provName != "ollama" {
-		autoFellBack = true
 		// Scan every known provider (not a hardcoded subset) so any
 		// env-based credential is discovered, e.g. an env-only
 		// amazon-bedrock setup (AWS_BEARER_TOKEN_BEDROCK / AWS_PROFILE /
@@ -435,7 +452,23 @@ func resolve(ctx context.Context, args Args, requireCred, inferenceOnly bool) (R
 		// knownProviders defines fallback priority. Local providers without a
 		// default model are skipped because selecting either one here would
 		// fail before the user can choose a model.
-		for _, other := range knownProviders {
+		//
+		// Custom providers from models.json join the scan after the
+		// built-in priority list, sorted by name so the choice is
+		// deterministic. Entries that override a built-in id are already
+		// covered by that built-in candidate. auth "none" providers are
+		// excluded: auth none disables stored credentials by contract,
+		// including api_key_command execution.
+		var customs []string
+		for name, customCfg := range provider.CustomProviders() {
+			if isBuiltinProvider(name) || customCfg.NoAuth {
+				continue
+			}
+			customs = append(customs, name)
+		}
+		sort.Strings(customs)
+		candidates := append(append([]string(nil), knownProviders...), customs...)
+		for _, other := range candidates {
 			if other == provName || other == "ollama" || other == provider.LlamaCPPProviderID || other == provider.LMStudioProviderID {
 				continue
 			}
@@ -447,25 +480,34 @@ func resolve(ctx context.Context, args Args, requireCred, inferenceOnly bool) (R
 			cred, method, accountID, credErr = c, m, a, err
 			break
 		}
+		// customCfg/keylessCustom above were computed for the pre-fallback
+		// provName and are stale after this loop reassigns it. That is safe:
+		// a picked custom provider is never NoAuth (filtered out of the
+		// candidate list), so keylessCustom stays false, and the model
+		// resolution below re-reads provider.CustomProviders()[provName]
+		// directly.
+
+		// Persist the auto-selected provider so it becomes the new default.
+		// Without this, every zot launch would re-run the fallback scan.
+		// Only persist in interactive mode (not requireCred) to avoid
+		// overwriting config.json in non-interactive contexts like print/json.
+		if provName != "anthropic" && !requireCred {
+			cfg.Provider = provName
+			cfg.Model = ""
+			_ = SaveConfig(cfg)
+		}
 	}
 
 	model := firstNonEmpty(args.Model, cfg.Model)
+	// autoDerived tracks whether the model id is chosen by zot itself
+	// (neither --model nor a persisted config model), which allows the
+	// discovery restore below to re-derive it once the catalog is filled.
+	autoDerived := args.Model == "" && cfg.Model == ""
 	if model == "" {
 		if provName == "ollama" || provName == provider.LlamaCPPProviderID || provName == provider.LMStudioProviderID {
 			return Resolved{}, fmt.Errorf("%s requires --model or a model selected from its manager", provName)
 		}
 		model = defaultModelForProvider(provName)
-	}
-	// If the resolved model belongs to a different provider (e.g. config
-	// says gpt-5 but we auto-fell back to anthropic), pick that provider's
-	// default. This override only fires when the provider was auto-fallback-
-	// changed, NOT when the user explicitly configured the pair — gateway/
-	// router providers (openrouter, vercel-ai-gateway, etc.) can serve
-	// models from any provider in the catalog.
-	if autoFellBack && provName != "ollama" {
-		if m, err := provider.FindModel("", model); err == nil && m.Provider != provName {
-			model = defaultModelForProvider(provName)
-		}
 	}
 	if provName == provider.LMStudioProviderID && LMStudioConfigured() {
 		// Restore transient metadata when resuming a local model after restart.
@@ -476,6 +518,20 @@ func resolve(ctx context.Context, args Args, requireCred, inferenceOnly bool) (R
 			// Same restore for discovery-enabled custom providers. Skipped
 			// when the model is already known to avoid a probe per launch.
 			_ = RefreshCustomProviderModels(ctx)
+			if autoDerived {
+				// The default was derived before discovery populated this
+				// provider's catalog, so it may be the global default (an
+				// anthropic id). Re-derive now that the catalog is filled.
+				model = defaultModelForProvider(provName)
+				// With nothing discovered there is no model id that belongs
+				// on this endpoint: refuse rather than route the global
+				// default to it. Explicitly chosen ids are still honoured
+				// by the open-catalogue fallback below, so a temporarily
+				// unreachable endpoint does not block startup.
+				if len(provider.ModelsForProvider(provName)) == 0 {
+					return Resolved{}, noDiscoveredModelsError(provName)
+				}
+			}
 		}
 	}
 	resolvedModel, err := provider.FindModel(provName, model)
@@ -1331,6 +1387,9 @@ func envVarName(provider string) string {
 	case "azure-openai-responses":
 		return "AZURE_OPENAI"
 	default:
-		return "ANTHROPIC"
+		// Custom providers follow the {NAME}_API_KEY convention used by
+		// resolveCredentialFull's generic env fallback, so the error names
+		// the variable the user can actually set (e.g. "AAA_API_KEY").
+		return normalizeCustomProviderEnvVar(provider)
 	}
 }

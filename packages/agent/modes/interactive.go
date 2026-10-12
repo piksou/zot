@@ -5890,8 +5890,11 @@ func (i *Interactive) handleAuthEvent(ev auth.Event) {
 	case "error":
 		i.dialog.ShowResult(false, ev.Message)
 	case "success":
-		// Rebuild the agent with the fresh credential.
-		ag, prov, model, err := i.cfg.BuildAgent()
+		// Rebuild the agent with the fresh credential for the provider
+		// that was just logged in. Use BuildAgentFor to explicitly specify
+		// the provider, since BuildAgent would read from config.json which
+		// may not have been updated yet.
+		ag, prov, model, err := i.cfg.BuildAgentFor(ev.Provider, "")
 		if err != nil {
 			i.dialog.ShowResult(false, err.Error())
 			return
@@ -5906,6 +5909,12 @@ func (i *Interactive) handleAuthEvent(ev auth.Event) {
 		i.applyAutoSwarmTool(i.autoSwarmEnabled())
 		i.applyOpenRouterServerTools(i.openRouterServerToolsEnabled())
 		i.applyTelegramTools(i.telegramBridge != nil && i.telegramBridge.Active())
+		// Persist the provider choice to config.json so it becomes the default.
+		// This is critical for custom providers that won't be auto-selected
+		// on the next run without an explicit config entry.
+		if i.cfg.PersistModel != nil {
+			i.cfg.PersistModel(prov, model)
+		}
 		i.dialog.ShowResult(true, "")
 	}
 }

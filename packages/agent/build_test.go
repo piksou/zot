@@ -408,6 +408,243 @@ func TestResolveEnvOnlyBedrockDiscoveredWithoutConfig(t *testing.T) {
 	}
 }
 
+// clearBuiltinCredentialEnv isolates resolve's auto-fallback scan from the
+// developer machine: every env var the builtin credential switch reads is
+// blanked, home-dir-derived credential stores (gcloud ADC, the Kimi CLI
+// token) are pointed at a scratch dir, and the Kimi CLI fallback is
+// disabled. Call after t.Setenv("ZOT_HOME", ...).
+func clearBuiltinCredentialEnv(t *testing.T) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("APPDATA", home)
+	for _, k := range []string{
+		"ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+		"KIMI_API_KEY", "MOONSHOT_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+		"DEEPSEEK_API_KEY", "GROQ_API_KEY", "XAI_API_KEY", "CEREBRAS_API_KEY",
+		"TOGETHER_API_KEY", "HF_TOKEN", "TYPESAFE_API_KEY", "OPENROUTER_API_KEY",
+		"GONDOLA_API_KEY", "YOLO_AUTO_API_KEY", "MISTRAL_API_KEY", "ZAI_API_KEY",
+		"MINIMAX_API_KEY", "MINIMAX_CN_API_KEY", "FIREWORKS_API_KEY",
+		"AI_GATEWAY_API_KEY", "OPENCODE_API_KEY", "COPILOT_GITHUB_TOKEN",
+		"GITHUB_COPILOT_TOKEN", "CLOUDFLARE_API_KEY", "AWS_ACCESS_KEY_ID",
+		"AWS_PROFILE", "AWS_BEARER_TOKEN_BEDROCK", "GOOGLE_CLOUD_API_KEY",
+		"GOOGLE_APPLICATION_CREDENTIALS", "AZURE_OPENAI_API_KEY",
+	} {
+		t.Setenv(k, "")
+	}
+	if err := SetKimiCLIFallbackDisabled(true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestResolveFallsBackToCredentialedCustomProvider covers the portable
+// models.json setup: no builtin provider is logged in, but a custom
+// provider has a stored key. Plain Resolve (no --provider, no config
+// provider) must land on the custom provider instead of reporting a
+// missing anthropic credential.
+func TestResolveFallsBackToCredentialedCustomProvider(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("AAA_API_KEY", "")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "api": "openai", "models": [{"id": "aaa-one"}]}
+	}}`)
+	if err := AuthStoreFor().SetAPIKey("aaa", "aaa-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Resolve(Args{NoSkill: true}, true)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if r.Provider != "aaa" {
+		t.Fatalf("provider = %q, want aaa", r.Provider)
+	}
+	if r.Credential != "aaa-key" || r.AuthMethod != "apikey" {
+		t.Fatalf("credential = %q method = %q, want stored aaa-key via apikey", r.Credential, r.AuthMethod)
+	}
+	if r.Model != "aaa-one" {
+		t.Fatalf("model = %q, want aaa-one", r.Model)
+	}
+}
+
+// TestResolveFallbackPrefersBuiltinOverCustomProvider pins the priority:
+// builtins are scanned before custom providers, so a logged-in builtin
+// wins over a credentialed custom provider.
+func TestResolveFallbackPrefersBuiltinOverCustomProvider(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("AAA_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "openai-key")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "models": [{"id": "aaa-one"}]}
+	}}`)
+	if err := AuthStoreFor().SetAPIKey("aaa", "aaa-key"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Resolve(Args{NoSkill: true}, true)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if r.Provider != "openai" {
+		t.Fatalf("provider = %q, want openai (builtin priority)", r.Provider)
+	}
+}
+
+// TestResolveFallbackPicksCustomsDeterministically checks that multiple
+// credentialed custom providers are scanned in sorted name order.
+func TestResolveFallbackPicksCustomsDeterministically(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	loadTestModelsJSON(t, `{"providers": {
+		"zzz":  {"baseUrl": "http://127.0.0.1:1/v1", "models": [{"id": "zzz-one"}]},
+		"aaa2": {"baseUrl": "http://127.0.0.1:2/v1", "models": [{"id": "aaa2-one"}]}
+	}}`)
+	for _, name := range []string{"zzz", "aaa2"} {
+		if err := AuthStoreFor().SetAPIKey(name, name+"-key"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r, err := Resolve(Args{NoSkill: true}, true)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if r.Provider != "aaa2" {
+		t.Fatalf("provider = %q, want aaa2 (sorted custom order)", r.Provider)
+	}
+}
+
+// TestResolveFallbackSkipsKeylessCustomProvider verifies that auth "none"
+// providers never join the fallback scan, even with a stray stored key:
+// auth none disables stored credentials by contract, including
+// api_key_command execution.
+func TestResolveFallbackSkipsKeylessCustomProvider(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("AAA_API_KEY", "")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "auth": "none", "models": [{"id": "aaa-one"}]}
+	}}`)
+	if err := AuthStoreFor().SetAPIKey("aaa", "stray"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Resolve(Args{NoSkill: true}, false)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if r.Provider != "anthropic" {
+		t.Fatalf("provider = %q, want anthropic (keyless custom skipped)", r.Provider)
+	}
+	if r.Credential != "" {
+		t.Fatalf("credential = %q, want empty (stray key never consulted)", r.Credential)
+	}
+}
+
+// TestResolveFallbackRespectsConfiguredProviderOverCustom pins
+// userPickedProvider semantics: a provider saved in config.json is
+// respected even when it has no credentials and a custom provider does.
+func TestResolveFallbackRespectsConfiguredProviderOverCustom(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("AAA_API_KEY", "")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "models": [{"id": "aaa-one"}]}
+	}}`)
+	if err := AuthStoreFor().SetAPIKey("aaa", "aaa-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveConfig(Config{Provider: "anthropic"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Resolve(Args{NoSkill: true}, false)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if r.Provider != "anthropic" {
+		t.Fatalf("provider = %q, want configured anthropic (no silent switch)", r.Provider)
+	}
+	if r.HasCredential() {
+		t.Fatal("anthropic unexpectedly credentialed")
+	}
+}
+
+// TestResolveUnknownConfigProviderFallsBackToCustom covers a typo'd (or
+// stale) provider value in config.json on a models.json-only setup:
+// resolve must land on the credentialed custom provider and repair the
+// persisted config, not reset to "anthropic" and demand a login on
+// every launch.
+func TestResolveUnknownConfigProviderFallsBackToCustom(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("AAA_API_KEY", "")
+	loadTestModelsJSON(t, `{"providers": {
+		"aaa": {"baseUrl": "http://127.0.0.1:1/v1", "api": "openai", "models": [{"id": "aaa-one"}]}
+	}}`)
+	if err := AuthStoreFor().SetAPIKey("aaa", "aaa-key"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveConfig(Config{Provider: "made-up-provider"}); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := Resolve(Args{NoSkill: true}, false)
+	if err != nil {
+		t.Fatalf("Resolve failed: %v", err)
+	}
+	if r.Provider != "aaa" {
+		t.Fatalf("provider = %q, want aaa", r.Provider)
+	}
+	if r.Credential != "aaa-key" || !r.HasCredential() {
+		t.Fatalf("credential = %q hasCred = %v, want stored aaa-key", r.Credential, r.HasCredential())
+	}
+	if r.Model != "aaa-one" {
+		t.Fatalf("model = %q, want aaa-one", r.Model)
+	}
+	// The repair must persist so the next launch starts on aaa directly.
+	out, _ := LoadConfig()
+	if out.Provider != "aaa" {
+		t.Fatalf("config.json provider = %q, want repaired aaa", out.Provider)
+	}
+}
+
+// TestFirstCredentialedProviderPrefersAnthropic pins the built-in reset
+// priority inherited from the sequential fallback the helper replaced:
+// anthropic first, then deepseek, kimi, openai-codex, openai.
+func TestFirstCredentialedProviderPrefersAnthropic(t *testing.T) {
+	t.Setenv("ZOT_HOME", t.TempDir())
+	clearBuiltinCredentialEnv(t)
+	t.Setenv("ANTHROPIC_API_KEY", "a")
+	t.Setenv("OPENAI_API_KEY", "o")
+	t.Setenv("DEEPSEEK_API_KEY", "d")
+	if got := firstCredentialedProvider(); got != "anthropic" {
+		t.Fatalf("firstCredentialedProvider() = %q, want anthropic", got)
+	}
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	if got := firstCredentialedProvider(); got != "deepseek" {
+		t.Fatalf("firstCredentialedProvider() = %q, want deepseek", got)
+	}
+}
+
+// TestEnvVarNameCustomProvider pins the missing-credential hint for
+// custom providers: the error must name the provider's own env var
+// (AAA_API_KEY), not ANTHROPIC_API_KEY.
+func TestEnvVarNameCustomProvider(t *testing.T) {
+	if got := envVarName("aaa"); got != "AAA" {
+		t.Fatalf("envVarName(aaa) = %q, want AAA", got)
+	}
+	if got := envVarName("my-gateway"); got != "MY_GATEWAY" {
+		t.Fatalf("envVarName(my-gateway) = %q, want MY_GATEWAY", got)
+	}
+	if got := envVarName("openai"); got != "OPENAI" {
+		t.Fatalf("envVarName(openai) = %q, want OPENAI", got)
+	}
+}
+
 func TestResolveOllamaUsesModelBaseURLBeforeDefault(t *testing.T) {
 	t.Setenv("ZOT_HOME", t.TempDir())
 	provider.SetLiveModels(nil)

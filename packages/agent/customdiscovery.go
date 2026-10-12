@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -30,6 +31,18 @@ func discoverableCustomProviders() []string {
 func isDiscoverableCustomProvider(name string) bool {
 	cfg, ok := provider.CustomProviders()[name]
 	return ok && cfg.Discover && strings.TrimSpace(cfg.BaseURL) != "" && !isBuiltinProvider(name)
+}
+
+// noDiscoveredModelsError is returned when a discovery-enabled provider
+// yields no models and zot would otherwise have to derive a default id
+// itself. Shared by resolve and continuousInference so both routes report
+// the same remedy.
+func noDiscoveredModelsError(name string) error {
+	return fmt.Errorf(
+		"provider %q has discover:true but no models were found; "+
+			"check the endpoint %q is reachable and returns a model list, "+
+			"or add explicit models to models.json",
+		name, provider.CustomProviders()[name].BaseURL)
 }
 
 // CustomDiscoveryConfigured reports whether any custom provider has live

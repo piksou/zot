@@ -94,8 +94,13 @@ func ValidateAndRepairConfig() {
 	changed := false
 
 	if cfg.Provider != "" && !isKnownProvider(cfg.Provider) {
-		fmt.Fprintf(os.Stderr, "zot: config.json: unknown provider %q reset to \"anthropic\"\n", cfg.Provider)
-		cfg.Provider = "anthropic"
+		// Reset to a provider that can actually run: built-ins first, then
+		// credentialed custom providers. Resetting to "anthropic" on a
+		// models.json-only setup would strand the user at the login dialog
+		// on every launch even though their custom provider is logged in.
+		fixed := firstCredentialedProvider()
+		fmt.Fprintf(os.Stderr, "zot: config.json: unknown provider %q reset to %q\n", cfg.Provider, fixed)
+		cfg.Provider = fixed
 		cfg.Model = ""
 		changed = true
 	}
