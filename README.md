@@ -84,6 +84,7 @@ The easiest way is to just run `zot` and type `/login`. The TUI opens even witho
 
 `$ZOT_HOME` defaults to:
 - All platforms: `$XDG_STATE_HOME/zot` when `XDG_STATE_HOME` is set
+- All platforms fallback: the directory containing the zot executable
 - macOS fallback: `~/Library/Application Support/zot`
 - Linux fallback: `~/.local/state/zot`
 - Windows fallback: `%LOCALAPPDATA%\zot`

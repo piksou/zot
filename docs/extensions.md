@@ -99,8 +99,10 @@ zot scans two directories on startup, in this order:
 
 A project-local extension with the same name wins over a global one.
 When `XDG_STATE_HOME` is set on any platform, `$ZOT_HOME` defaults to
-`$XDG_STATE_HOME/zot`. Otherwise it defaults to `~/Library/Application Support/zot/`
-on macOS, `~/.local/state/zot` on Linux, or `%LOCALAPPDATA%\zot` on Windows.
+`$XDG_STATE_HOME/zot`. Otherwise it defaults to the directory containing the
+zot executable, falling back to `~/Library/Application Support/zot/`
+on macOS, `~/.local/state/zot` on Linux, or `%LOCALAPPDATA%\zot` on Windows
+when that cannot be determined.
 
 Because each extension owns its own directory, the recommended place
 for extension state is inside that directory itself (for example

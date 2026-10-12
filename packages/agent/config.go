@@ -159,7 +159,8 @@ type Config struct {
 	LastChangelogShown string `json:"last_changelog_shown,omitempty"`
 }
 
-// ZotHome returns $ZOT_HOME or the OS-default data dir.
+// ZotHome returns $ZOT_HOME, the directory of the running executable,
+// or the OS-default data dir, in that order of preference.
 //
 // All zot state (config.json, auth.json, sessions/, logs/) lives under
 // this directory.
@@ -169,6 +170,9 @@ func ZotHome() string {
 	}
 	if v := os.Getenv("XDG_STATE_HOME"); v != "" {
 		return filepath.Join(v, "zot")
+	}
+	if exe, err := os.Executable(); err == nil && filepath.IsAbs(exe) {
+		return filepath.Dir(exe)
 	}
 	switch runtime.GOOS {
 	case "darwin":
